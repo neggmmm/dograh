@@ -242,10 +242,14 @@ async def create_user_configuration_with_mps_key(
         else:
             # For authenticated mode, use the secret key and organization ID
             if not DOGRAH_MPS_SECRET_KEY:
+                # BYOK / self-hosted: no managed MPS key available.
+                # Skip default-config provisioning instead of failing the
+                # whole request; the user supplies their own LLM/TTS/STT keys
+                # in Settings → Service Configurations.
                 logger.warning(
-                    "Warning: DOGRAH_MPS_SECRET_KEY not set for authenticated mode"
+                    "DOGRAH_MPS_SECRET_KEY not set; skipping default MPS config provisioning (BYOK mode)"
                 )
-                raise ValidationError("Missing DOGRAH_MPS_SECRET_KEY in non oss mode")
+                return None
 
             response = await client.post(
                 f"{MPS_API_URL}/api/v1/service-keys/",
