@@ -6,6 +6,8 @@ const OSS_TOKEN_COOKIE = 'dograh_auth_token';
 // Paths that don't require authentication in OSS mode
 const PUBLIC_PATHS = ['/auth/login', '/auth/signup'];
 
+// Only a SUCCESSFUL, non-local read is cached. Failures are never cached,
+// so a transient backend outage can't permanently pin the UI to local/OSS.
 let cachedAuthProvider: string | null = null;
 
 async function fetchAuthProvider(): Promise<string> {
@@ -15,24 +17,45 @@ async function fetchAuthProvider(): Promise<string> {
 
   try {
     const backendUrl = process.env.BACKEND_URL || 'http://localhost:8000';
-    const res = await fetch(`${backendUrl}/api/v1/health`);
+
+    // Abort the health probe if the backend is slow/unreachable, so middleware
+    // doesn't hang on every request during a backend hiccup.
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3000);
+
+    const res = await fetch(`${backendUrl}/api/v1/health`, {
+      signal: controller.signal,
+      cache: 'no-store',
+    });
+    clearTimeout(timeout);
+
     if (res.ok) {
       const data = await res.json();
-      cachedAuthProvider = (data.auth_provider as string) || 'local';
-      return cachedAuthProvider;
+      const provider = (data.auth_provider as string) || 'local';
+      // Cache ONLY on a successful read.
+      cachedAuthProvider = provider;
+      return provider;
     }
-  } catch {
-    // Backend not reachable — fall back to local
+
+    console.warn(
+      `[middleware] /health returned ${res.status}; treating as local for this request only`,
+    );
+  } catch (err) {
+    // Backend not reachable — do NOT cache. Next request will retry.
+    console.warn(
+      `[middleware] could not reach backend /health (${String(err)}); treating as local for this request only`,
+    );
   }
 
-  cachedAuthProvider = 'local';
-  return cachedAuthProvider;
+  // Fall back without caching, so the next request re-probes the backend.
+  return 'local';
 }
 
 export async function middleware(request: NextRequest) {
   const authProvider = await fetchAuthProvider();
 
-  // Only handle OSS mode
+  // Only OSS (local) mode is gated here. In Stack mode, let everything through;
+  // Stack handles auth on the client/route side.
   if (authProvider !== 'local') {
     return NextResponse.next();
   }
