@@ -9,7 +9,7 @@ RUN apk add --no-cache python3 make g++ libc6-compat
 # Copy package files
 COPY ui/package*.json ./
 # Clean install with proper handling of native modules
-RUN --mount=type=cache,target=/root/.npm npm ci
+RUN npm ci
 # Stage 2: Builder
 FROM node:20-alpine AS builder
 WORKDIR /app
