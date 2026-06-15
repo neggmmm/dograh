@@ -6,7 +6,8 @@ FROM python:3.13-slim AS builder
 
 WORKDIR /app
 
-# Install git in builder stage (needed for any pip install from git URLs)
+# Install git in builder stage (needed for pip installs from git URLs and for
+# cloning the pipecat source below).
 RUN apt-get update && apt-get install -y \
     git \
     && apt-get clean \
@@ -22,17 +23,28 @@ ENV VIRTUAL_ENV=/opt/venv \
     PATH=/opt/venv/bin:$PATH
 RUN python -m venv "$VIRTUAL_ENV"
 
+# Layer 1: API deps. Copy requirements then install (BuildKit mounts removed
+# so this builds on non-BuildKit builders like Railway).
 COPY api/requirements.txt /tmp/req.txt
 RUN uv pip install -r /tmp/req.txt
 
-# Layer 2: pipecat deps. Copy pipecat source then install (BuildKit mounts
-# removed for non-BuildKit builders).
-COPY pipecat /tmp/pipecat
+# Layer 2: pipecat deps. The fork does not vendor the pipecat submodule
+# contents (it is an empty submodule reference in a plain fork), so clone it
+# at the pinned submodule commit during the build instead of COPY-ing it.
+# After installing pipecat, two hardening tweaks:
+#   1. Swap opencv-python (pulled by pipecat[webrtc]) for opencv-python-headless.
+#      The non-headless build links against X11/Qt (libxcb*); without those
+#      shared libs in the image, `import cv2` fails at runtime.
+#   2. Pre-download NLTK's punkt_tab tokenizer so pipecat's text processing
+#      doesn't hit the network on first agent run. NLTK auto-finds it under
+#      sys.prefix/nltk_data, so it travels with the venv on COPY.
+RUN git clone --recurse-submodules https://github.com/dograh-hq/pipecat.git /tmp/pipecat \
+ && cd /tmp/pipecat \
+ && git checkout 0d64dc6e0e3e6b3c46cc66373e34b4f54f980268
 RUN uv pip install '/tmp/pipecat[cartesia,deepgram,openai,elevenlabs,groq,google,azure,sarvam,soundfile,silero,webrtc,speechmatics,openrouter,camb,mcp]' \
  && uv pip uninstall opencv-python \
  && uv pip install opencv-python-headless \
  && python -c "import nltk; nltk.download('punkt_tab', download_dir='/opt/venv/nltk_data', quiet=True)"
- 
 
 # Strip cache files, test/example dirs, and type stubs from the venv
 RUN find /opt/venv -type f -name '*.pyc' -delete && \
