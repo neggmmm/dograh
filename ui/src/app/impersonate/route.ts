@@ -18,11 +18,20 @@ export async function GET(request: NextRequest) {
         return new Response("Missing refresh_token", { status: 400 });
     }
 
+    // Behind a reverse proxy (e.g. Railway), `request.url` reflects the
+    // container's internal host/port rather than the public-facing domain
+    // the browser actually hit. The real domain is forwarded via
+    // `x-forwarded-host` / `x-forwarded-proto`, so prefer those when present
+    // and only fall back to `request.url` (e.g. local dev) otherwise.
+    const forwardedHost = request.headers.get("x-forwarded-host");
+    const forwardedProto = request.headers.get("x-forwarded-proto") ?? "https";
+    const origin = forwardedHost ? `${forwardedProto}://${forwardedHost}` : request.url;
+
     // Prepare redirect – if the supplied redirect path is an absolute URL we use
     // it as-is, otherwise we resolve it relative to the current request.
     const redirectUrl = redirectPath.startsWith("http")
         ? redirectPath
-        : new URL(redirectPath, request.url).toString();
+        : new URL(redirectPath, origin).toString();
 
     const response = NextResponse.redirect(redirectUrl);
 
