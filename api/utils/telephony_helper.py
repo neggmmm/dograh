@@ -3,6 +3,8 @@ Telephony helper utilities.
 Common functions used across telephony operations.
 """
 
+import re
+
 from fastapi import Request
 from loguru import logger
 from starlette.responses import HTMLResponse
@@ -182,3 +184,30 @@ def get_countries_for_code(dialing_code: str) -> list[str]:
         return []
 
     return [country for country, code in COUNTRY_CODES.items() if code == dialing_code]
+
+
+def e164_to_national(e164: str) -> str:
+    """Convert an E.164 number to its national format (digits only).
+
+    Used to build SIP endpoint strings for trunks that expect the national
+    number (e.g. Egypt "+201063681459" → "01063681459"), since the leading-zero
+    rule is country-specific. Falls back to the digits after the "+" if the
+    number cannot be parsed.
+
+    Args:
+        e164: Phone number in E.164 form (must start with "+").
+
+    Returns:
+        National-format number as a digit string (e.g. "01063681459").
+    """
+    import phonenumbers
+
+    try:
+        parsed = phonenumbers.parse(e164, None)
+        national = phonenumbers.format_number(
+            parsed, phonenumbers.PhoneNumberFormat.NATIONAL
+        )
+        return re.sub(r"\D", "", national)
+    except phonenumbers.NumberParseException:
+        logger.warning(f"Could not parse '{e164}' as E.164; using raw digits")
+        return re.sub(r"\D", "", e164)

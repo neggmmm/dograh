@@ -339,6 +339,50 @@ class CampaignCallDispatcher:
                 },
             )
 
+        # Check quota after run creation so hosted v2 can mint and store MPS correlation ID
+        try:
+            from api.services.quota_service import authorize_workflow_run_start
+
+            quota_result = await authorize_workflow_run_start(
+                workflow_id=campaign.workflow_id,
+                workflow_run_id=workflow_run.id,
+            )
+            if not quota_result.has_quota:
+                error_message = quota_result.error_message or "Quota exceeded"
+                logger.warning(
+                    f"Campaign {campaign.id} quota check failed for workflow run "
+                    f"{workflow_run.id}: {error_message}"
+                )
+                await db_client.update_workflow_run(
+                    run_id=workflow_run.id,
+                    is_completed=True,
+                    state=WorkflowRunState.COMPLETED.value,
+                    gathered_context={"error": error_message},
+                )
+
+                mapping = await rate_limiter.get_workflow_slot_mapping(workflow_run.id)
+                if mapping:
+                    org_id, mapped_slot_id = mapping
+                    await rate_limiter.release_concurrent_slot(org_id, mapped_slot_id)
+                    await rate_limiter.delete_workflow_slot_mapping(workflow_run.id)
+
+                from_number_mapping = await rate_limiter.get_workflow_from_number_mapping(
+                    workflow_run.id
+                )
+                if from_number_mapping:
+                    fn_org_id, fn_number, fn_tcid = from_number_mapping
+                    await rate_limiter.release_from_number(
+                        fn_org_id, fn_number, telephony_configuration_id=fn_tcid
+                    )
+                    await rate_limiter.delete_workflow_from_number_mapping(workflow_run.id)
+
+                raise ValueError(error_message)
+        except Exception as e:
+            if isinstance(e, ValueError):
+                raise
+            logger.error(f"Quota check error: {e}")
+            raise
+
         # Initiate call via telephony provider
         try:
             # Construct webhook URL with parameters
@@ -352,13 +396,50 @@ class CampaignCallDispatcher:
                 f"&organization_id={campaign.organization_id}"
             )
 
+            # Optionally wrap the destination in a SIP endpoint template for
+            # trunks that expect a "PJSIP/<prefix><national>@<trunk>" style
+            # endpoint. CSV numbers stay in +E.164; "{number}" is substituted
+            # with the national-format number. When no template is configured,
+            # the +E.164 number is dialed as-is (plain PSTN).
+            to_number = phone_number
+            sip_template = (campaign.orchestrator_metadata or {}).get(
+                "sip_endpoint_template"
+            )
+            logger.debug(
+                f"[Campaign {campaign.id}] SIP template check",
+                extra={"sip_template": sip_template, "to_number": to_number},
+            )
+            if sip_template:
+                from api.utils.telephony_helper import e164_to_national
+
+                to_number = sip_template.replace(
+                    "{number}", e164_to_national(phone_number)
+                )
+                logger.info(
+                    f"[Campaign {campaign.id}] SIP template applied: "
+                    f"{phone_number} -> {to_number}"
+                )
+
+            logger.info(
+                f"[Campaign {campaign.id}] Initiating call",
+                extra={
+                    "to_number": to_number,
+                    "from_number": from_number,
+                    "provider": provider.PROVIDER_NAME,
+                    "workflow_run_id": workflow_run.id,
+                },
+            )
             call_result = await provider.initiate_call(
-                to_number=phone_number,
+                to_number=to_number,
                 webhook_url=webhook_url,
                 workflow_run_id=workflow_run.id,
                 from_number=from_number,
                 workflow_id=campaign.workflow_id,
                 user_id=campaign.created_by,
+            )
+            logger.info(
+                f"[Campaign {campaign.id}] Call initiated successfully",
+                extra={"call_id": call_result.call_id if call_result else None},
             )
 
             # Store provider type and metadata in gathered_context
