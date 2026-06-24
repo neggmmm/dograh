@@ -602,6 +602,18 @@ class ARIConnection:
                 f"(caller={caller_number}, called={called_number})"
             )
 
+            # 4. Check quota (apply per-workflow model_overrides).
+            quota_result = await check_dograh_quota_by_user_id(
+                user_id, workflow_id=inbound_workflow_id
+            )
+            if not quota_result.has_quota:
+                logger.warning(
+                    f"[ARI org={self.organization_id}] Quota exceeded for user {user_id} "
+                    f"— hanging up inbound call {channel_id}"
+                )
+                await self._delete_channel(channel_id)
+                return
+
             # 5. Answer the inbound channel
             await self._answer_channel(channel_id)
 
