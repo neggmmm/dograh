@@ -26,7 +26,7 @@ from loguru import logger
 from api.constants import REDIS_URL
 from api.db import db_client
 from api.enums import CallType, WorkflowRunMode
-from api.services.quota_service import check_dograh_quota_by_user_id
+from api.services.quota_service import authorize_workflow_run_start
 from api.services.telephony.call_transfer_manager import get_call_transfer_manager
 from api.services.telephony.transfer_event_protocol import (
     TransferEvent,
@@ -496,16 +496,62 @@ class ARIConnection:
             logger.error(f"[ARI org={self.organization_id}] Failed to create bridge")
             return ""
 
-        # Add channels to bridge
-        await self._ari_request(
-            "POST",
-            f"/bridges/{bridge_id}/addChannel",
-            params={"channel": ",".join(channel_ids)},
-        )
+        # Add channels to bridge with retry (handles race condition on StasisStart).
+        # External media channels may not be fully ready when we first try to bridge
+        # them, causing "Channel not found" (400) errors. A brief wait usually fixes it.
+        channel_str = ",".join(channel_ids)
+        success = False
+        for attempt in range(3):
+            success = await self._bridge_add_channel_with_check(
+                bridge_id, channel_str
+            )
+            if success:
+                break
+            if attempt < 2:
+                await asyncio.sleep(0.05)  # Brief wait before retry
+                logger.debug(
+                    f"[ARI org={self.organization_id}] Retrying addChannel "
+                    f"(attempt {attempt + 1}/3) for bridge {bridge_id}"
+                )
+
+        if not success:
+            logger.error(
+                f"[ARI org={self.organization_id}] Failed to add channels to bridge "
+                f"{bridge_id} after 3 attempts"
+            )
+
         logger.info(
             f"[ARI org={self.organization_id}] Bridge {bridge_id} created with channels: {channel_ids}"
         )
         return bridge_id
+
+    async def _bridge_add_channel_with_check(
+        self, bridge_id: str, channel_str: str
+    ) -> bool:
+        """Try to add channel(s) to a bridge. Returns True if successful (HTTP 200/201/204)."""
+        url = f"{self.ari_endpoint}/ari/bridges/{bridge_id}/addChannel"
+        auth = aiohttp.BasicAuth(self.app_name, self.app_password)
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url,
+                    params={"channel": channel_str},
+                    auth=auth,
+                ) as response:
+                    if response.status in (200, 201, 204):
+                        return True
+                    # Return False to trigger retry on error
+                    response_text = await response.text()
+                    logger.debug(
+                        f"[ARI org={self.organization_id}] addChannel returned {response.status}: {response_text}"
+                    )
+                    return False
+        except Exception as e:
+            logger.debug(
+                f"[ARI org={self.organization_id}] addChannel exception: {e}"
+            )
+            return False
 
     async def _handle_inbound_stasis_start(
         self, channel_id: str, channel_state: str, event: dict
@@ -564,19 +610,7 @@ class ARIConnection:
 
             user_id = workflow.user_id
 
-            # 3. Check quota (apply per-workflow model_overrides).
-            quota_result = await check_dograh_quota_by_user_id(
-                user_id, workflow_id=inbound_workflow_id
-            )
-            if not quota_result.has_quota:
-                logger.warning(
-                    f"[ARI org={self.organization_id}] Quota exceeded for user {user_id} "
-                    f"— hanging up inbound call {channel_id}"
-                )
-                await self._delete_channel(channel_id)
-                return
-
-            # 4. Create workflow run
+            # 3. Create workflow run
             call_id = channel_id
             workflow_run = await db_client.create_workflow_run(
                 name=f"ARI Inbound {caller_number}",
@@ -601,6 +635,20 @@ class ARIConnection:
                 f"{workflow_run.id} for channel {channel_id} "
                 f"(caller={caller_number}, called={called_number})"
             )
+
+            # 4. Check quota after the run exists so hosted v2 can mint and
+            # store the MPS correlation id before the pipeline starts.
+            quota_result = await authorize_workflow_run_start(
+                workflow_id=inbound_workflow_id,
+                workflow_run_id=workflow_run.id,
+            )
+            if not quota_result.has_quota:
+                logger.warning(
+                    f"[ARI org={self.organization_id}] Quota exceeded for user {user_id} "
+                    f"— hanging up inbound call {channel_id}"
+                )
+                await self._delete_channel(channel_id)
+                return
 
             # 5. Answer the inbound channel
             await self._answer_channel(channel_id)
