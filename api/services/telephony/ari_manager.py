@@ -32,6 +32,7 @@ from api.services.telephony.transfer_event_protocol import (
     TransferEvent,
     TransferEventType,
 )
+from api.utils.common import get_backend_endpoints
 
 # Redis key pattern and TTL for channel-to-run mapping
 _CHANNEL_KEY_PREFIX = "ari:channel:"
@@ -450,6 +451,12 @@ class ARIConnection:
         that id. The caller can then register ext-channel state ahead of
         the POST and avoid racing against the StasisStart event.
         """
+        # Get the actual backend WebSocket URL to pass to Asterisk
+        _, ws_url = await get_backend_endpoints()
+        # Extract hostname from the WebSocket URL (strip protocol and path)
+        # e.g., wss://api.example.com -> api.example.com
+        ws_host = ws_url.replace("wss://", "").replace("ws://", "").split("/")[0]
+
         # v() appends URI query params to the websocket_client.conf URL
         # e.g. wss://api.dograh.com/ws/ari?workflow_id=1&user_id=2&workflow_run_id=3
         transport_data = (
@@ -460,7 +467,7 @@ class ARIConnection:
 
         params = {
             "app": self.app_name,
-            "external_host": self.ws_client_name,
+            "external_host": ws_host,
             "format": "ulaw",
             "transport": "websocket",
             "encapsulation": "none",

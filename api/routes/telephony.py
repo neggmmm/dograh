@@ -60,6 +60,12 @@ class InitiateCallRequest(BaseModel):
     from_phone_number_id: int | None = None
 
 
+class InitiateCallResponse(BaseModel):
+    message: str
+    workflow_run_id: int
+    user_id: int
+
+
 def _get_execution_user_id(workflow) -> int:
     if workflow.user_id is None:
         raise HTTPException(
@@ -242,7 +248,11 @@ async def initiate_call(
         initial_context=updated_initial_context,
     )
 
-    return {"message": f"Call initiated successfully with run name {workflow_run_name}"}
+    return InitiateCallResponse(
+        message=f"Call initiated successfully with run name {workflow_run_name}",
+        workflow_run_id=workflow_run_id,
+        user_id=execution_user_id,
+    )
 
 
 async def _verify_organization_phone_number(
